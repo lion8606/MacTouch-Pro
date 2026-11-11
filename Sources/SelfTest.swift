@@ -1,0 +1,102 @@
+import CoreGraphics
+import Foundation
+
+// MARK: --self-test
+
+/// Checks the parts that need no hardware: the panel-to-display transforms, the calibration rewrite
+/// and every known controller's report layout against its recorded samples. Exits 0 if all pass.
+func runSelfTest() -> Never {
+    var checks = 0, failures = 0
+    func expect(_ ok: Bool, _ what: @autoclosure () -> String) {
+        checks += 1
+        if !ok { failures += 1; print("FAIL: " + what()) }
+    }
+    func near(_ a: CGPoint, _ b: CGPoint, _ tol: Double = 1e-9) -> Bool { abs(a.x - b.x) < tol && abs(a.y - b.y) < tol }
+
+    let transforms = [0, 90, 180, 270].flatMap { r in [false, true].flatMap { s in [false, true].flatMap { fx in [false, true].map { fy in
+        PanelTransform(rotation: r, swap: s, flipX: fx, flipY: fy) } } } }
+    let points = [CGPoint(x: 0.1, y: 0.2), CGPoint(x: 0.9, y: 0.35), CGPoint(x: 0.5, y: 0.75)]
+
+    // toPanel undoes toDisplay, for every rotation and axis fix.
+    for t in transforms {
+        for p in points { expect(near(t.toPanel(t.toDisplay(p)), p), "toPanel(toDisplay(\(p))) with \(t)") }
+    }
+    // The panel turns with the picture: where the panel's top-left corner ends up on the display.
+    let corners = [0: CGPoint(x: 0, y: 0), 90: CGPoint(x: 1, y: 0), 180: CGPoint(x: 1, y: 1), 270: CGPoint(x: 0, y: 1)]
+    for (r, c) in corners { expect(near(PanelTransform(rotation: r).toDisplay(.zero), c), "rotation \(r): panel top-left at \(c)") }
+
+    // A calibration from 3.1.0 or older (display fractions) and its panel-fraction rewrite map every
+    // touch to the same display point.
+    let oldCal = [0.95, 0.03, 1.04, -0.02]
+    for t in transforms {
+        let newCal = t.calibrationToPanel(oldCal)
+        for p in points {
+            let before = applyCal(t.toDisplay(p), oldCal), after = t.toDisplay(applyCal(p, newCal))
+            expect(near(before, after), "calibration rewrite at \(p) with \(t): \(before) vs \(after)")
+        }
+    }
+
+    // Edge values: an edge reading maps to its target, the edge zones join the line, every axis keeps
+    // rising, and edge values that would fold an axis back are dropped.
+    let (a, b) = (0.87, 0.006), line = { (t: Double) in a * t + b }
+    let edged = [a, b, a, b, line(calEdge) + 0.012, line(1 - calEdge) - 0.01, line(calEdge) + 0.008, line(1 - calEdge) - 0.015]
+    for (axis, lo, hi) in [(\CGPoint.x, edged[4], edged[5]), (\CGPoint.y, edged[6], edged[7])] {
+        func mapped(_ u: Double) -> Double { Double(applyCal(CGPoint(x: u, y: u), edged)[keyPath: axis]) }
+        expect(abs(mapped(lo) - calEdge) < 1e-9 && abs(mapped(hi) - (1 - calEdge)) < 1e-9, "edge readings map to their targets")
+        for t in [calInner, 1 - calInner, 0.5] { expect(abs(mapped(line(t)) - t) < 1e-9, "edge zone joins the line at \(t)") }
+        let sweep = stride(from: 0.0, through: 1.0, by: 0.001).map(mapped)
+        expect(zip(sweep, sweep.dropFirst()).allSatisfy { $0 <= $1 }, "calibrated axis keeps rising")
+        expect(sweep.first == 0 && sweep.last == 1, "both edges reachable")
+    }
+    expect(validCal(edged)?.count == 8, "plausible edge values kept")
+    expect(validCal(Array(edged.prefix(4)) + [line(0.2), edged[5], edged[6], edged[7]])?.count == 4, "folding edge value dropped")
+    expect(validCal([a, b, a]) == nil, "three numbers are no calibration")
+
+    // Taps: a move counts only when the next report confirms it, and a tap rests at its median.
+    unconfirmedMove = false
+    expect([true, true].map(confirmedMove) == [false, true], "a move confirmed by the next report counts")
+    unconfirmedMove = false
+    expect([true, false, true].map(confirmedMove) == [false, false, false], "a one-report jump is not a move")
+    unconfirmedMove = false
+    let rest = [CGPoint(x: 10, y: 20), CGPoint(x: 11, y: 21), CGPoint(x: 12, y: 19), CGPoint(x: 25, y: 33)]
+    expect(near(median(rest), CGPoint(x: 11.5, y: 20.5)), "a tap rests at its median, not at a stray report")
+
+    // Momentum: the release speed leaves out the lift-off jump, and a finger that stopped gets none.
+    let flick = (0..<8).map { (t: 100 + Double($0) * 0.01, dx: 0.0, dy: 10.0) } + [(t: 100.08, dx: 0.0, dy: -30.0)]
+    let v = releaseVelocity(flick, at: 100.09)
+    expect(v.map { abs($0.x) < 1e-6 && abs($0.y - 1000) < 1e-6 } == true, "release speed 1000 pt/s, without the lift-off jump: \(String(describing: v))")
+    expect(releaseVelocity(flick, at: 100.2) == nil, "no momentum after the finger stopped")
+
+    // Trackpad defaults and geometry helpers: rotation wrap-around, multi-finger spread radius, and out-of-the-box config.
+    let defCfg = Config()
+    expect(defCfg.oneFingerScroll && defCfg.twoFingerTap && defCfg.rotateGesture && defCfg.smartZoom
+           && defCfg.rightEdgeNC && defCfg.threeFingerTap && defCfg.fourFingerPinch,
+           "full macOS trackpad gesture suite enabled by default")
+    expect(abs(angleDiffDeg(10, 350) - 20) < 1e-9 && abs(angleDiffDeg(-170, 170) - 20) < 1e-9, "angleDiffDeg wraps across ±180°")
+    let sq = [CGPoint(x: 0, y: 0), CGPoint(x: 100, y: 0), CGPoint(x: 100, y: 100), CGPoint(x: 0, y: 100)]
+    expect(abs(meanRadius(sq, around: CGPoint(x: 50, y: 50)) - hypot(50, 50)) < 1e-9, "meanRadius of 4-finger spread")
+
+    // Report layouts against their recorded samples.
+    for k in knownControllers {
+        guard let raw = k.raw else { continue }
+        let l = raw.layout
+        expect(!raw.samples.isEmpty, "\(k.name): has recorded samples")
+        for (n, s) in raw.samples.enumerated() {
+            guard let bytes = s.bytes(for: l) else { expect(false, "\(k.name) sample \(n + 1): start is longer than length"); continue }
+            guard let got = l.contacts(in: bytes) else { expect(false, "\(k.name) sample \(n + 1): not read as a touch report"); continue }
+            let want = s.contacts.mapValues { CGPoint(x: Double($0.x) / l.maxX, y: Double($0.y) / l.maxY) }
+            expect(Set(got.keys) == Set(want.keys), "\(k.name) sample \(n + 1): contacts \(got.keys.sorted()), expected \(want.keys.sorted())")
+            for (id, p) in want { if let g = got[id] { expect(near(g, p), "\(k.name) sample \(n + 1) contact \(id): \(g), expected \(p)") } }
+        }
+        var other = raw.samples.first?.bytes(for: l) ?? [0, 0, 0]
+        other[0] = l.reportID &+ 1
+        expect(l.contacts(in: other) == nil, "\(k.name): a report with another ID is not a touch report")
+        expect(l.contacts(in: [l.reportID, 0x03, 0x01]) == nil, "\(k.name): a report too short for one contact is not a touch report")
+        // A contact count larger than the records the report holds must not read the count byte as data.
+        let tight = [l.reportID] + [UInt8](repeating: 0x55, count: l.firstContact + l.contactSize - 1) + [UInt8(l.maxContacts)]
+        expect((l.contacts(in: tight)?.count ?? 0) <= 1, "\(k.name): records stop before the count byte")
+    }
+
+    print(failures == 0 ? "self-test passed (\(checks) checks)" : "self-test: \(failures) of \(checks) checks failed")
+    exit(failures == 0 ? 0 : 1)
+}
